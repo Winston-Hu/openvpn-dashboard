@@ -1,0 +1,29 @@
+# OpenVPN Dashboard — systemd unit file
+#
+# HOW TO INSTALL:
+#   1. Replace <APP_USER> with the OS user that will run the app (e.g. vpnadmin).
+#   2. Copy this file to /etc/systemd/system/:
+#        sudo cp openvpn-dashboard.service /etc/systemd/system/
+#   3. Reload systemd and enable:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now openvpn-dashboard
+#   4. Check status:
+#        sudo systemctl status openvpn-dashboard
+#   5. View logs:
+#        sudo journalctl -u openvpn-dashboard -f
+
+[Unit]
+Description=OpenVPN Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=<APP_USER>
+WorkingDirectory=/home/<APP_USER>/apps/openvpn-dashboard
+ExecStart=/usr/bin/node .next/standalone/server.js
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/home/<APP_USER>/apps/openvpn-dashboard/.env
+
+[Install]
+WantedBy=multi-user.target
