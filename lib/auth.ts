@@ -12,7 +12,7 @@ export const sessionOptions: SessionOptions = {
     process.env.SESSION_SECRET ?? 'dev-secret-change-in-production-32chars!!',
   cookieName: 'openvpn-dashboard-session',
   cookieOptions: {
-    secure: process.env.NODE_ENV === 'production',
+    secure: process.env.SESSION_COOKIE_SECURE !== 'false',
     httpOnly: true,
     sameSite: 'lax',
   },
