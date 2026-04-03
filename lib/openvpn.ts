@@ -133,89 +133,116 @@ async function isExecutable(filePath: string): Promise<boolean> {
 }
 
 /**
- * Parse OpenVPN status.log (version 1 format).
+ * Parse OpenVPN status.log.
  *
- * Example format:
- * OpenVPN CLIENT LIST
- * Updated,Thu Apr  3 07:00:00 2026
- * Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since
- * client1,1.2.3.4:12345,123456,654321,Thu Apr  3 06:00:00 2026
- * ROUTING TABLE
- * ...
+ * Supports two formats automatically:
+ *
+ * Format 2 (newer, used by OpenVPN 2.4+):
+ *   TITLE,OpenVPN 2.7.1 ...
+ *   TIME,2026-04-03 13:32:10,1775223130
+ *   HEADER,CLIENT_LIST,Common Name,Real Address,Virtual Address,...
+ *   CLIENT_LIST,<name>,<real>,<vpn>,<vpn6>,<rx>,<tx>,<since>,<since_t>,...
+ *   HEADER,ROUTING_TABLE,...
+ *   ROUTING_TABLE,...
+ *   GLOBAL_STATS,...
+ *   END
+ *
+ * Format 1 (legacy):
+ *   OpenVPN CLIENT LIST
+ *   Updated,<date>
+ *   Common Name,Real Address,Bytes Received,Bytes Sent,Connected Since
+ *   <name>,<real>,<rx>,<tx>,<since>
+ *   ROUTING TABLE
+ *   Virtual Address,Common Name,Real Address,Last Ref
+ *   <vpn>,<name>,<real>,<lastref>
+ *   GLOBAL STATS
+ *   END
  */
 export async function getConnectedClients(): Promise<ConnectedClient[]> {
   try {
     const content = await fs.readFile(STATUS_LOG, 'utf-8')
     const lines = content.split('\n')
 
-    const clients: ConnectedClient[] = []
-    let inClientList = false
-    let inRoutingTable = false
-
-    // Build a map of commonName -> vpnAddress from routing table
-    const vpnAddressMap: Record<string, string> = {}
-
-    for (const line of lines) {
-      if (line.startsWith('ROUTING TABLE')) {
-        inRoutingTable = true
-        inClientList = false
-        continue
-      }
-      if (line.startsWith('GLOBAL STATS') || line.startsWith('END')) {
-        inRoutingTable = false
-        continue
-      }
-      if (inRoutingTable) {
-        // Virtual Address,Common Name,Real Address,Last Ref
-        const parts = line.split(',')
-        if (parts.length >= 2 && !line.startsWith('Virtual Address')) {
-          vpnAddressMap[parts[1]] = parts[0]
-        }
-      }
+    // Detect format by first non-empty line
+    const firstLine = lines.find((l) => l.trim() !== '') ?? ''
+    if (firstLine.startsWith('TITLE,') || firstLine.startsWith('TIME,') || lines.some((l) => l.startsWith('CLIENT_LIST,'))) {
+      return parseStatusV2(lines)
     }
-
-    inClientList = false
-    for (const line of lines) {
-      if (line.startsWith('OpenVPN CLIENT LIST')) {
-        inClientList = true
-        continue
-      }
-      if (line.startsWith('ROUTING TABLE') || line.startsWith('GLOBAL STATS')) {
-        inClientList = false
-        continue
-      }
-      if (!inClientList) continue
-      if (
-        line.startsWith('Updated,') ||
-        line.startsWith('Common Name,') ||
-        line.trim() === ''
-      ) {
-        continue
-      }
-
-      const parts = line.split(',')
-      if (parts.length < 5) continue
-
-      const commonName = parts[0]
-      const realAddress = parts[1]
-      const bytesReceived = parseInt(parts[2], 10) || 0
-      const bytesSent = parseInt(parts[3], 10) || 0
-      const connectedSince = parts.slice(4).join(',')
-
-      clients.push({
-        commonName,
-        realAddress,
-        vpnAddress: vpnAddressMap[commonName] ?? '',
-        bytesReceived,
-        bytesSent,
-        connectedSince,
-      })
-    }
-
-    return clients
+    return parseStatusV1(lines)
   } catch {
     return []
   }
+}
+
+/** Parse format 2: CLIENT_LIST rows with positional fields from HEADER */
+function parseStatusV2(lines: string[]): ConnectedClient[] {
+  const clients: ConnectedClient[] = []
+
+  // The HEADER line for CLIENT_LIST tells us the column order, but the
+  // order is fixed by the OpenVPN spec so we use known indices:
+  // CLIENT_LIST,CommonName,RealAddr,VirtualAddr,VirtualIPv6Addr,
+  //   BytesReceived,BytesSent,ConnectedSince,ConnectedSince(time_t),...
+  const IDX = { name: 1, real: 2, vpn: 3, rx: 5, tx: 6, since: 7 }
+
+  for (const line of lines) {
+    if (!line.startsWith('CLIENT_LIST,')) continue
+    const parts = line.split(',')
+    if (parts.length < 8) continue
+
+    clients.push({
+      commonName: parts[IDX.name],
+      realAddress: parts[IDX.real],
+      vpnAddress: parts[IDX.vpn],
+      bytesReceived: parseInt(parts[IDX.rx], 10) || 0,
+      bytesSent: parseInt(parts[IDX.tx], 10) || 0,
+      connectedSince: parts[IDX.since],
+    })
+  }
+
+  return clients
+}
+
+/** Parse format 1: legacy block-style format */
+function parseStatusV1(lines: string[]): ConnectedClient[] {
+  const clients: ConnectedClient[] = []
+
+  // Build vpnAddress map from ROUTING TABLE section
+  const vpnAddressMap: Record<string, string> = {}
+  let inRoutingTable = false
+  for (const line of lines) {
+    if (line.startsWith('ROUTING TABLE')) { inRoutingTable = true; continue }
+    if (line.startsWith('GLOBAL STATS') || line.startsWith('END')) { inRoutingTable = false; continue }
+    if (inRoutingTable) {
+      const parts = line.split(',')
+      if (parts.length >= 2 && !line.startsWith('Virtual Address')) {
+        vpnAddressMap[parts[1]] = parts[0]
+      }
+    }
+  }
+
+  // Parse CLIENT LIST section
+  let inClientList = false
+  for (const line of lines) {
+    if (line.startsWith('OpenVPN CLIENT LIST')) { inClientList = true; continue }
+    if (line.startsWith('ROUTING TABLE') || line.startsWith('GLOBAL STATS')) { inClientList = false; continue }
+    if (!inClientList) continue
+    if (line.startsWith('Updated,') || line.startsWith('Common Name,') || line.trim() === '') continue
+
+    const parts = line.split(',')
+    if (parts.length < 5) continue
+
+    const commonName = parts[0]
+    clients.push({
+      commonName,
+      realAddress: parts[1],
+      vpnAddress: vpnAddressMap[commonName] ?? '',
+      bytesReceived: parseInt(parts[2], 10) || 0,
+      bytesSent: parseInt(parts[3], 10) || 0,
+      connectedSince: parts.slice(4).join(','),
+    })
+  }
+
+  return clients
 }
 
 export async function getKnownClients(): Promise<KnownClient[]> {
@@ -262,8 +289,16 @@ export async function getServerInfo(): Promise<ServerInfo> {
     const lines = content.split('\n')
 
     for (const line of lines) {
+      // Format 2: TIME,2026-04-03 13:32:10,1775223130
+      if (line.startsWith('TIME,')) {
+        const parts = line.split(',')
+        if (parts[1]) statusLastUpdated = parts[1].trim()
+        break
+      }
+      // Format 1: Updated,Thu Apr  3 07:00:00 2026
       if (line.startsWith('Updated,')) {
         statusLastUpdated = line.replace('Updated,', '').trim()
+        break
       }
     }
 
