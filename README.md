@@ -450,10 +450,10 @@ sudo chgrp ubuntu /etc/openvpn/server/easy-rsa/pki
 sudo chmod 755 /etc/openvpn/server/easy-rsa/pki
 
 sudo chgrp -R ubuntu /etc/openvpn/server/easy-rsa/pki/issued
-sudo chmod -R 750 /etc/openvpn/server/easy-rsa/pki/issued
+sudo chmod -R 755 /etc/openvpn/server/easy-rsa/pki/issued
 
-sudo chgrp -R ubuntu /etc/openvpn/server/ccd
-sudo chmod -R 750 /etc/openvpn/server/ccd
+sudo chmod 755 /etc/openvpn/server/ccd
+sudo chmod 644 /etc/openvpn/server/ccd/*
 ```
 
 如果还需要 dashboard 读取私钥目录，则再额外处理：
@@ -466,6 +466,86 @@ sudo chmod -R 750 /etc/openvpn/server/easy-rsa/pki/private
 注意：
 - 给 `private/` 读权限会扩大应用可读敏感材料的范围
 - 长期更稳妥的方式是用受控脚本和 `sudoers`
+
+实际排查结果：
+- dashboard 里 `Cert Expiry` 显示 `Missing`，根因通常不是证书不存在，而是 `ubuntu` 进程读不到 `issued/*.crt`
+- OpenVPN 固定 IP 不生效时，根因可能不是 `ifconfig-push` 写错，而是 OpenVPN 进程本身读不到 `ccd/<client>`
+
+本次实际验证可用的修复方式：
+
+```bash
+sudo find /etc/openvpn/server/easy-rsa/pki/issued -maxdepth 1 -type f -name '*.crt' -exec chmod 644 {} +
+sudo chmod 755 /etc/openvpn/server/ccd
+sudo chmod 644 /etc/openvpn/server/ccd/*
+```
+
+效果：
+- dashboard 可以读取证书有效期
+- OpenVPN 可以读取 `ccd/<client>`
+- `ifconfig-push` 固定 IP 可以正常生效
+
+### 8. `ifconfig-push` 写了但 client 仍然拿到动态 IP
+
+现象：
+- `ccd/<client>` 文件里已经有：
+
+```conf
+ifconfig-push 10.188.0.14 255.255.255.0
+```
+
+但客户端还是拿到池里的动态 IP，比如：
+
+```text
+10.188.0.4
+```
+
+原因：
+- `server.conf` 虽然已经启用了：
+
+```text
+client-config-dir ccd
+```
+
+- 但 OpenVPN 实际运行用户是：
+
+```text
+user nobody
+group nogroup
+```
+
+- 如果 `ccd/` 目录权限不允许该进程读取，就会在日志中出现：
+
+```text
+Could not access file 'ccd/<client>': Permission denied (errno=13)
+```
+
+结果：
+- 服务端忽略 `ccd`
+- 回退到动态地址池分配
+
+验证方法：
+
+```bash
+sudo journalctl -u openvpn-server@server -n 100 --no-pager
+```
+
+如果修复成功，应该能看到：
+
+```text
+OPTIONS IMPORT: reading client specific options from: ccd/<client>
+...
+ifconfig 10.188.0.14 255.255.255.0
+```
+
+修复后还需要：
+- 把当前 client 会话踢掉
+- 让客户端重新连接
+
+例如：
+
+```bash
+echo "kill Winston_Windows" | sudo socat - UNIX-CONNECT:/var/run/openvpn-server/server.sock
+```
 
 ## 只允许 VPN 网段访问 dashboard
 
