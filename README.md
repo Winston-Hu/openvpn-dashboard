@@ -19,8 +19,9 @@
 2. 本地开发与提交
 3. 服务器部署流程
 4. 关键环境变量
-5. 踩过的坑与解决方法
-6. 常用运维命令
+5. HTTPS 与 VPN-only 访问
+6. 踩过的坑与解决方法
+7. 常用运维命令
 
 ## 项目定位
 
@@ -124,12 +125,16 @@ cp .env.example .env
 nano .env
 ```
 
-当前环境实际使用的可用配置如下：
+当前环境实际使用过两套配置：
+- 初期调试：`http://10.188.0.1:3000`
+- 正式使用：`https://vpndashboard.relicflow.com`
+
+正式 HTTPS 部署建议使用如下配置：
 
 ```env
 DATABASE_URL="file:./prisma/dev.db"
 SESSION_SECRET="replace-with-a-random-secret"
-SESSION_COOKIE_SECURE=false
+SESSION_COOKIE_SECURE=true
 
 BOOTSTRAP_ADMIN_USERNAME="admin"
 BOOTSTRAP_ADMIN_PASSWORD="<your_passwd>"
@@ -148,8 +153,15 @@ OPENVPN_CA_CERT="/etc/openvpn/server/easy-rsa/pki/ca.crt"
 OPENVPN_MGMT_SOCK="/var/run/openvpn-server/server.sock"
 
 OPENVPN_SERVER_HOST="<your_server_address>"
-NEXT_PUBLIC_APP_URL="http://10.188.0.1:3000"
+NEXT_PUBLIC_APP_URL="https://vpndashboard.relicflow.com"
 PORT=3000
+```
+
+如果你还处于“纯 VPN 内 HTTP 调试阶段”，才临时改成：
+
+```env
+SESSION_COOKIE_SECURE=false
+NEXT_PUBLIC_APP_URL="http://10.188.0.1:3000"
 ```
 
 ### 4. 初始化数据库
@@ -264,6 +276,128 @@ curl -i -X POST http://10.188.0.1:3000/api/auth/login \
 ```
 
 如果响应头里的 `Set-Cookie` **不再包含** `Secure`，说明这个坑已经修好。
+
+### `SESSION_COOKIE_SECURE=true`
+
+一旦切换到正式 HTTPS 域名访问，应恢复成：
+
+```env
+SESSION_COOKIE_SECURE=true
+```
+
+本次最终采用的是：
+
+```text
+https://vpndashboard.relicflow.com
+```
+
+原因：
+- Safari 等浏览器对 `HTTP + IP + Cookie` 更挑剔
+- HTTPS 下登录态更稳定
+- 更适合多人长期使用
+
+## HTTPS 与 VPN-only 访问
+
+最终验证可用的结构如下：
+- `openvpn-dashboard` 运行在：`127.0.0.1:3000`
+- `Caddy` 监听：`80` 和 `443`
+- 用户访问：`https://vpndashboard.relicflow.com`
+- 主机防火墙只允许 `10.188.0.0/24` 访问 `443`
+- 非 VPN 来源访问 `443` 被主机侧防火墙丢弃
+
+### 1. DNS
+
+增加 `A` 记录：
+
+```text
+vpndashboard.relicflow.com -> 13.237.209.198
+```
+
+验证：
+
+```bash
+dig +short vpndashboard.relicflow.com
+```
+
+### 2. 安装并配置 Caddy
+
+```bash
+sudo apt update
+sudo apt install -y caddy
+```
+
+实际使用的 `Caddyfile`：
+
+```caddy
+vpndashboard.relicflow.com {
+    @vpn_only remote_ip 10.188.0.0/24 127.0.0.1/32
+    handle @vpn_only {
+        reverse_proxy 127.0.0.1:3000
+    }
+
+    handle {
+        respond "Forbidden" 403
+    }
+}
+```
+
+应用配置：
+
+```bash
+sudo caddy validate --config /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
+sudo systemctl restart caddy
+```
+
+### 3. AWS Security Group
+
+为了让 ACME/Let's Encrypt 能签证书，至少要放行：
+- `TCP 80` from `0.0.0.0/0`
+- `TCP 443` from `0.0.0.0/0`
+
+注意：
+- AWS 层先放开
+- 真正“只允许 VPN 访问”的限制由主机侧 `iptables` 完成
+
+### 4. 主机侧 iptables
+
+实际使用的限制思路：
+- `3000/tcp`：只允许 `127.0.0.1`，其余 `DROP`
+- `443/tcp`：允许 `127.0.0.1` 和 `10.188.0.0/24`，其余 `DROP`
+- `80/tcp`：允许公网，供 ACME 验证
+
+### 5. 持久化 iptables
+
+如果不持久化，重启后这些规则可能丢失：
+- Dashboard 的 `443/3000` 限制会失效
+- OpenVPN 的 `1194/udp`、`FORWARD`、`MASQUERADE` 规则也可能丢失
+
+本次采用：
+
+```bash
+sudo apt install -y iptables-persistent
+sudo netfilter-persistent save
+```
+
+保存结果：
+
+```text
+/etc/iptables/rules.v4
+```
+
+后续每次修改规则后都执行：
+
+```bash
+sudo netfilter-persistent save
+```
+
+### 6. 最终验证
+
+本次最终验证结果：
+- Caddy 日志里出现 `certificate obtained successfully`
+- VPN 内可访问 `https://vpndashboard.relicflow.com`
+- 非 VPN 来源访问 `443` 被主机侧防火墙拦截
+- `3000` 不再直接暴露给外部客户端
 
 ## 踩过的坑与解决方法
 
@@ -385,6 +519,12 @@ SESSION_COOKIE_SECURE=false
 ```bash
 npm run build
 sudo systemctl restart openvpn-dashboard
+```
+
+如果多个浏览器表现不一致，尤其是 Safari 和 Firefox 行为不同，优先不要继续纠缠 `HTTP + IP`，而是直接切换到：
+
+```text
+HTTPS + 域名 + 反向代理
 ```
 
 ### 6. Dashboard 显示没有在线设备，但 OpenVPN 明明在线
@@ -522,6 +662,57 @@ Could not access file 'ccd/<client>': Permission denied (errno=13)
 结果：
 - 服务端忽略 `ccd`
 - 回退到动态地址池分配
+
+解决方法：
+
+```bash
+sudo chmod 755 /etc/openvpn/server/ccd
+sudo chmod 644 /etc/openvpn/server/ccd/*
+```
+
+然后把当前 client 会话踢掉，让它重新连接。
+
+### 9. Caddy 一直拿不到证书
+
+现象：
+
+```text
+Timeout during connect (likely firewall problem)
+```
+
+原因：
+- 域名已经解析到 EC2
+- 但公网到 `80/tcp` 的链路没打通
+- 常见是 AWS Security Group 没开 `80/443`
+
+解决方法：
+- AWS Security Group 开：
+  - `TCP 80 -> 0.0.0.0/0`
+  - `TCP 443 -> 0.0.0.0/0`
+- 主机侧再用 `iptables` 收紧 `443`
+
+成功日志关键字：
+
+```text
+certificate obtained successfully
+```
+
+### 10. `Cert Expiry` 显示 `Missing`
+
+现象：
+- `/clients/all` 中部分 client 的 `Cert Expiry` 是 `Missing`
+
+原因：
+- `issued/*.crt` 存在
+- 但 dashboard 进程用户 `ubuntu` 读不到
+
+解决方法：
+
+```bash
+sudo find /etc/openvpn/server/easy-rsa/pki/issued -maxdepth 1 -type f -name '*.crt' -exec chmod 644 {} +
+```
+
+这样 dashboard 就能正常用 `openssl x509 -enddate` 读取证书有效期。
 
 验证方法：
 
